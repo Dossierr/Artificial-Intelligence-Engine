@@ -3,13 +3,12 @@ import redis
 import environ
 from langchain.cache import RedisCache
 from langchain.memory import RedisChatMessageHistory
-from langchain.chains import ConversationChain
+from langchain.chains import ConversationalRetrievalChain, ConversationChain
 from langchain.memory import ConversationBufferMemory
 from langchain.globals import set_llm_cache
 from langchain.llms.bedrock import Bedrock
-from langchain.callbacks import get_openai_callback
-import tiktoken
-
+from utils import num_tokens_from_string, parse_history, parse_relevant_documents
+from vectorstore import chroma_index
 
 
 #loading ENV variables
@@ -26,74 +25,70 @@ r = redis.Redis(
 #Uses Redis as cache for frequent queries witha time to live
 set_llm_cache(RedisCache(r, ttl=60*60))
 
-#Define credentials
-access_key_id = env('BEDROCK_AWS_ACCESS_KEY_ID')
-secret_access_key = env('BEDROCK_AWS_SECRET_KEY')
-
 #Log into bedrock as a client
 client_boto3 = boto3.client(service_name="bedrock-runtime", 
-                       aws_access_key_id=access_key_id, 
-                       aws_secret_access_key=secret_access_key)
+                       aws_access_key_id=env('BEDROCK_AWS_ACCESS_KEY_ID'), 
+                       aws_secret_access_key=env('BEDROCK_AWS_SECRET_KEY'))
 
 #Defining the Model we want to use
 modelId = "amazon.titan-text-express-v1"         
 titan_llm = Bedrock(model_id=modelId, client=client_boto3, streaming=False)
-titan_llm.model_kwargs = {'temperature': 0.1}
+titan_llm.model_kwargs = {'temperature': 0.1, }
 
 #Setting memory for conversation
 memory = ConversationBufferMemory()
 memory.human_prefix = "User"
 memory.ai_prefix = "Bot"
 
-def num_tokens_from_string(string: str) -> int:
-    """Returns the number of tokens in a text string."""
-    encoding = tiktoken.get_encoding("cl100k_base")
-    num_tokens = len(encoding.encode(string))
-    return num_tokens
-
-def parse_history(chat_history):
-    return_string = """""" #Storing a empty string that we'll return
-    toggle = True #So we can alternate between user and AI
-    for i in chat_history.messages[-5:]: #We take the last 3 messages for the context window
-        if i.type == 'human': 
-            user = 'User: '
-        else:
-            user = 'ai: '
-        return_string = return_string + user + str(i.content) +'\n'
-    #print(return_string)
-    return return_string
     
     
 def query(case_id, query):
+    database = chroma_index(case_id=case_id, query=query)
     chat_history = RedisChatMessageHistory(
         url=env('REDIS_URL'),
         session_id='-history',
         key_prefix=case_id,
         ttl=3600*24)
-    
+    retrieved_documents = database.similarity_search_with_score(query)
+    retrieved_text, retrieved_sources = parse_relevant_documents(retrieved_documents)
+    print('#### RETRIEVED DOCUMENTS #### \n', retrieved_text)
+    print("### LENGHT ###", len(retrieved_documents))
+    print("### SOURCES ###", retrieved_sources)
+
     conversation = ConversationChain(
         llm=titan_llm, 
         verbose=True, 
-        memory=memory
+        memory=memory,
         )
     
 
     conversation.prompt.template = """
         System: The following is a friendly conversation between a knowledgeable helpful assistant and a customer. 
-        Only answer as the bot, never as the customer. The assistant is talkative and provides lots of specific details from it's context.\n\n
-        Current conversation:\n {history}"""+ str(parse_history(chat_history=chat_history))+"""\nUser: {input}\nBot:
+        Only answer as the bot, never as the customer, don't prepend your answer with AI:. The assistant is talkative and provides lots of specific details from it's context.\n\n
+        Current conversation:\n {history}"""+ str(parse_history(chat_history=chat_history))+"""\nUser: {input}\n
+        Bot:
         """
 
     try:
         result =  conversation.predict(input=query)
         chat_history.add_user_message(query)
         chat_history.add_ai_message(result)
-        tokens_used = num_tokens_from_string(conversation.prompt.template)
-        print("####### TOKEN COUNT #######")
-        print('total tokens used: ', tokens_used)
-        print('query tokens: ', num_tokens_from_string(query))
-        print('Result tokens: ', num_tokens_from_string(result))
-        print("Chat history: ",num_tokens_from_string(parse_history(chat_history=chat_history)))
+        prompt_tokens = num_tokens_from_string(conversation.prompt.template)
+        query_tokens = num_tokens_from_string(query)
+        result_tokens = num_tokens_from_string(result)
+        retrieved_document_tokens = 200
+        chat_history_tokens = num_tokens_from_string(parse_history(chat_history=chat_history))
+        documents_retrieved = ['test.pdf', 'document.pdf']
+        result = {
+            'answer': result,
+            'total_tokens': prompt_tokens+query_tokens+result_tokens+chat_history_tokens + retrieved_document_tokens,
+            'prompt_tokens': prompt_tokens,
+            'query_tokens': query_tokens,
+            'result_tokens': result_tokens,
+            'chat_history_tokens': chat_history_tokens,
+            'documents_retrieved': documents_retrieved,
+            'document_retrieved_tokens': retrieved_document_tokens
+        }
         return result
 
     except ValueError as error:
@@ -111,5 +106,5 @@ def query(case_id, query):
     return "something went wrong"
     
     
-test = query(case_id='yes', query='What should I do when visiting Amsterdam?')
+test = query(case_id='testfolder', query='Wat zegt de VVD  over het milieu?')
 print(test)
